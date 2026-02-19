@@ -194,6 +194,44 @@ def download_instagram_content(url: str) -> str:
     return None
 
 
+def extract_reels_audio(video_path: str) -> str:
+    """
+    Extracts audio from a video file and saves it as MP3.
+    Returns the path to the MP3 file.
+    """
+    if not video_path or not os.path.exists(video_path):
+        return None
+    
+    # Generate MP3 path
+    base_path = os.path.splitext(video_path)[0]
+    mp3_path = f"{base_path}_audio.mp3"
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '128',
+        }],
+        'outtmpl': base_path + '_audio.%(ext)s',
+    }
+
+    try:
+        # We use yt-dlp to extract audio from the ALREADY DOWNLOADED file
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # yt-dlp can take a local file path as "URL"
+            ydl.extract_info(video_path, download=True)
+            
+            if os.path.exists(mp3_path):
+                return mp3_path
+    except Exception as e:
+        logging.error(f"Error extracting audio from video: {e}")
+        
+    return None
+
+
 # ========================
 # Music Search & Download Functions
 # ========================
@@ -331,9 +369,25 @@ async def handle_instagram_link(message: types.Message):
         try:
             media_file = FSInputFile(filename)
             caption = "Mana faylingiz! 📥"
+            is_video = filename.lower().endswith(('.mp4', '.mkv', '.mov'))
             
-            if filename.lower().endswith(('.mp4', '.mkv', '.mov')):
+            if is_video:
                 await message.answer_video(video=media_file, caption=caption)
+                
+                # If it's a Reels/Video, extract and send audio too
+                if "/reel/" in url or "/reels/" in url or is_video:
+                    audio_path = await loop.run_in_executor(None, extract_reels_audio, filename)
+                    if audio_path and os.path.exists(audio_path):
+                        audio_file = FSInputFile(audio_path)
+                        await message.answer_audio(
+                            audio=audio_file, 
+                            caption="🎵 Videodagi musiqa"
+                        )
+                        # Clean up audio file
+                        try:
+                            os.remove(audio_path)
+                        except:
+                            pass
             elif filename.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                 await message.answer_photo(photo=media_file, caption=caption)
             else:
