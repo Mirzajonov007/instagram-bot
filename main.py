@@ -1,12 +1,15 @@
 import asyncio
 import logging
 import os
+import re
+import glob
 import sys
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile
 from aiohttp import web, ClientSession
+import instaloader
 import yt_dlp
 
 # Load environment variables
@@ -29,6 +32,18 @@ dp = Dispatcher()
 # Output directory for downloads
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# Initialize Instaloader
+L = instaloader.Instaloader(
+    dirname_pattern=DOWNLOAD_DIR,
+    filename_pattern="{shortcode}",
+    download_video_thumbnails=False,
+    download_geotags=False,
+    download_comments=False,
+    save_metadata=False,
+    compress_json=False,
+    post_metadata_txt_pattern="",
+)
 
 # ========================
 # Keep-Alive Web Server
@@ -68,14 +83,75 @@ async def keep_alive():
             await asyncio.sleep(300)  # Every 5 minutes
 
 # ========================
-# Bot Handlers
+# Instagram Download Functions
 # ========================
 
-def download_instagram_content(url: str):
-    """
-    Downloads Instagram content using yt-dlp.
-    Returns the path to the downloaded file.
-    """
+def extract_shortcode(url: str) -> str:
+    """Extract shortcode from Instagram URL."""
+    patterns = [
+        r'instagram\.com/p/([A-Za-z0-9_-]+)',
+        r'instagram\.com/reel/([A-Za-z0-9_-]+)',
+        r'instagram\.com/reels/([A-Za-z0-9_-]+)',
+        r'instagram\.com/tv/([A-Za-z0-9_-]+)',
+        r'instagram\.com/stories/[^/]+/(\d+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def download_with_instaloader(url: str) -> str:
+    """Download Instagram content using instaloader."""
+    try:
+        shortcode = extract_shortcode(url)
+        if not shortcode:
+            logging.error(f"Could not extract shortcode from URL: {url}")
+            return None
+        
+        # Check if it's a story link
+        if '/stories/' in url:
+            logging.info("Story links require login, skipping instaloader")
+            return None
+        
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        L.download_post(post, target="")
+        
+        # Find the downloaded file
+        for ext in ['mp4', 'jpg', 'jpeg', 'png', 'webp']:
+            pattern = os.path.join(DOWNLOAD_DIR, f"{shortcode}*.{ext}")
+            files = glob.glob(pattern)
+            if files:
+                return files[0]
+        
+        # Check for any file with the shortcode
+        pattern = os.path.join(DOWNLOAD_DIR, f"{shortcode}*")
+        files = glob.glob(pattern)
+        if files:
+            # Filter out txt/json files
+            media_files = [f for f in files if not f.endswith(('.txt', '.json', '.xz'))]
+            if media_files:
+                return media_files[0]
+        
+        logging.error(f"File not found after download for shortcode: {shortcode}")
+        return None
+    except instaloader.exceptions.LoginRequiredException:
+        logging.warning("Instaloader: Login required, trying yt-dlp fallback")
+        return None
+    except instaloader.exceptions.QueryReturnedNotFoundException:
+        logging.error(f"Instaloader: Post not found: {url}")
+        return None
+    except instaloader.exceptions.PrivateProfileNotFollowedException:
+        logging.error(f"Instaloader: Private profile: {url}")
+        return None
+    except Exception as e:
+        logging.error(f"Instaloader error: {type(e).__name__}: {e}")
+        return None
+
+
+def download_with_ytdlp(url: str) -> str:
+    """Download Instagram content using yt-dlp as fallback."""
     outtmpl = os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s')
     
     ydl_opts = {
@@ -83,6 +159,11 @@ def download_instagram_content(url: str):
         'quiet': True,
         'no_warnings': True,
         'format': 'best',
+        'socket_timeout': 30,
+        'retries': 3,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
     }
 
     try:
@@ -91,8 +172,38 @@ def download_instagram_content(url: str):
             filename = ydl.prepare_filename(info)
             return filename
     except Exception as e:
-        logging.error(f"Error downloading content: {e}")
+        logging.error(f"yt-dlp error: {type(e).__name__}: {e}")
         return None
+
+
+def download_instagram_content(url: str) -> str:
+    """
+    Downloads Instagram content.
+    Tries instaloader first, falls back to yt-dlp.
+    Returns the path to the downloaded file.
+    """
+    logging.info(f"Attempting download: {url}")
+    
+    # Try instaloader first
+    filename = download_with_instaloader(url)
+    if filename and os.path.exists(filename):
+        logging.info(f"Downloaded with instaloader: {filename}")
+        return filename
+    
+    # Fallback to yt-dlp
+    logging.info("Trying yt-dlp fallback...")
+    filename = download_with_ytdlp(url)
+    if filename and os.path.exists(filename):
+        logging.info(f"Downloaded with yt-dlp: {filename}")
+        return filename
+    
+    logging.error(f"All download methods failed for: {url}")
+    return None
+
+
+# ========================
+# Bot Handlers
+# ========================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
