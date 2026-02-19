@@ -3,11 +3,11 @@ import logging
 import os
 import re
 import glob
-import sys
+import hashlib
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiohttp import web, ClientSession
 import instaloader
 import yt_dlp
@@ -45,6 +45,9 @@ L = instaloader.Instaloader(
     post_metadata_txt_pattern="",
 )
 
+# Store for music search results (video_id -> url mapping)
+music_cache = {}
+
 # ========================
 # Keep-Alive Web Server
 # ========================
@@ -72,7 +75,7 @@ async def keep_alive():
         logging.warning("RENDER_EXTERNAL_URL not set, keep-alive disabled")
         return
     
-    await asyncio.sleep(60)  # Wait 1 minute before first ping
+    await asyncio.sleep(60)
     async with ClientSession() as session:
         while True:
             try:
@@ -80,7 +83,7 @@ async def keep_alive():
                     logging.info(f"Keep-alive ping: {resp.status}")
             except Exception as e:
                 logging.warning(f"Keep-alive ping failed: {e}")
-            await asyncio.sleep(300)  # Every 5 minutes
+            await asyncio.sleep(300)
 
 # ========================
 # Instagram Download Functions
@@ -110,7 +113,6 @@ def download_with_instaloader(url: str) -> str:
             logging.error(f"Could not extract shortcode from URL: {url}")
             return None
         
-        # Check if it's a story link
         if '/stories/' in url:
             logging.info("Story links require login, skipping instaloader")
             return None
@@ -118,18 +120,15 @@ def download_with_instaloader(url: str) -> str:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         L.download_post(post, target="")
         
-        # Find the downloaded file
         for ext in ['mp4', 'jpg', 'jpeg', 'png', 'webp']:
             pattern = os.path.join(DOWNLOAD_DIR, f"{shortcode}*.{ext}")
             files = glob.glob(pattern)
             if files:
                 return files[0]
         
-        # Check for any file with the shortcode
         pattern = os.path.join(DOWNLOAD_DIR, f"{shortcode}*")
         files = glob.glob(pattern)
         if files:
-            # Filter out txt/json files
             media_files = [f for f in files if not f.endswith(('.txt', '.json', '.xz'))]
             if media_files:
                 return media_files[0]
@@ -177,20 +176,14 @@ def download_with_ytdlp(url: str) -> str:
 
 
 def download_instagram_content(url: str) -> str:
-    """
-    Downloads Instagram content.
-    Tries instaloader first, falls back to yt-dlp.
-    Returns the path to the downloaded file.
-    """
+    """Downloads Instagram content. Tries instaloader first, falls back to yt-dlp."""
     logging.info(f"Attempting download: {url}")
     
-    # Try instaloader first
     filename = download_with_instaloader(url)
     if filename and os.path.exists(filename):
         logging.info(f"Downloaded with instaloader: {filename}")
         return filename
     
-    # Fallback to yt-dlp
     logging.info("Trying yt-dlp fallback...")
     filename = download_with_ytdlp(url)
     if filename and os.path.exists(filename):
@@ -202,12 +195,129 @@ def download_instagram_content(url: str) -> str:
 
 
 # ========================
+# Music Search & Download Functions
+# ========================
+
+def search_music(query: str) -> list:
+    """
+    Search for music on YouTube using yt-dlp.
+    Returns list of dicts with: title, url, duration, video_id, artist
+    """
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True,
+        'default_search': 'ytsearch10',
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            result = ydl.extract_info(f"ytsearch10:{query}", download=False)
+            
+            if not result or 'entries' not in result:
+                return []
+            
+            songs = []
+            for entry in result['entries']:
+                if not entry:
+                    continue
+                
+                video_id = entry.get('id', '')
+                title = entry.get('title', 'Noma\'lum')
+                url = entry.get('url', f"https://www.youtube.com/watch?v={video_id}")
+                duration = entry.get('duration') or 0
+                artist = entry.get('uploader', '') or entry.get('channel', '')
+                
+                # Format duration
+                if duration:
+                    mins = int(duration) // 60
+                    secs = int(duration) % 60
+                    dur_str = f"{mins}:{secs:02d}"
+                else:
+                    dur_str = "—"
+                
+                # Create short key for callback data (max 64 bytes)
+                short_key = hashlib.md5(video_id.encode()).hexdigest()[:10]
+                
+                # Cache the URL
+                music_cache[short_key] = {
+                    'url': f"https://www.youtube.com/watch?v={video_id}",
+                    'title': title,
+                    'artist': artist,
+                }
+                
+                songs.append({
+                    'title': title,
+                    'url': url,
+                    'duration': dur_str,
+                    'video_id': video_id,
+                    'artist': artist,
+                    'key': short_key,
+                })
+            
+            return songs
+    except Exception as e:
+        logging.error(f"Music search error: {type(e).__name__}: {e}")
+        return []
+
+
+def download_music(url: str) -> tuple:
+    """
+    Download music from YouTube as MP3.
+    Returns (filepath, title, artist) or (None, None, None)
+    """
+    outtmpl = os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s')
+    
+    ydl_opts = {
+        'outtmpl': outtmpl,
+        'quiet': True,
+        'no_warnings': True,
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '128',
+        }],
+        'socket_timeout': 30,
+        'retries': 3,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            # yt-dlp changes ext to mp3 after postprocessing
+            video_id = info.get('id', 'unknown')
+            mp3_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
+            title = info.get('title', 'Noma\'lum')
+            artist = info.get('uploader', '') or info.get('channel', '')
+            
+            if os.path.exists(mp3_path):
+                return mp3_path, title, artist
+            
+            # Try to find the file with any extension and check
+            for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}.*")):
+                if f.endswith(('.mp3', '.m4a', '.opus', '.ogg', '.wav')):
+                    return f, title, artist
+            
+            return None, None, None
+    except Exception as e:
+        logging.error(f"Music download error: {type(e).__name__}: {e}")
+        return None, None, None
+
+
+# ========================
 # Bot Handlers
 # ========================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Salom! Menga Instagram reels, post yoki storiy linkini yuboring, men uni yuklab beraman. 🚀")
+    await message.answer(
+        "🎵 Salom! Men ko'p funksiyali botman:\n\n"
+        "🎶 **Musiqa qidirish** — qo'shiq yoki qo'shiqchi nomini yozing\n"
+        "📸 **Instagram yuklab olish** — Instagram linkini yuboring\n\n"
+        "Boshlash uchun qo'shiq nomini yoki Instagram linkini yuboring! 🚀",
+        parse_mode="Markdown"
+    )
 
 @dp.message(F.text.contains("instagram.com"))
 async def handle_instagram_link(message: types.Message):
@@ -227,7 +337,7 @@ async def handle_instagram_link(message: types.Message):
             elif filename.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                 await message.answer_photo(photo=media_file, caption=caption)
             else:
-                 await message.answer_document(document=media_file, caption=caption)
+                await message.answer_document(document=media_file, caption=caption)
             
             await status_msg.delete()
         except Exception as e:
@@ -241,6 +351,97 @@ async def handle_instagram_link(message: types.Message):
                 logging.error(f"Error deleting file: {e}")
     else:
         await status_msg.edit_text("Kechirasiz, bu linkdan yuklab bo'lmadi.\nLink to'g'riligini yoki profil ochiqligini tekshiring. 🔒")
+
+
+@dp.message(F.text)
+async def handle_music_search(message: types.Message):
+    """Handle music search - any text that is not an Instagram link."""
+    query = message.text.strip()
+    
+    # Skip if too short
+    if len(query) < 2:
+        return
+    
+    # Skip commands
+    if query.startswith('/'):
+        return
+    
+    status_msg = await message.reply("🔍 Qidirilmoqda...")
+
+    loop = asyncio.get_event_loop()
+    songs = await loop.run_in_executor(None, search_music, query)
+
+    if not songs:
+        await status_msg.edit_text("😕 Hech narsa topilmadi. Boshqa so'z bilan qidirib ko'ring.")
+        return
+
+    # Build inline keyboard with results
+    buttons = []
+    for i, song in enumerate(songs, 1):
+        btn_text = f"🎵 {song['title'][:45]} [{song['duration']}]"
+        buttons.append([InlineKeyboardButton(
+            text=btn_text,
+            callback_data=f"music:{song['key']}"
+        )])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await status_msg.edit_text(
+        f"🎶 **\"{query}\"** bo'yicha natijalar:\n\nYuklash uchun qo'shiqni tanlang 👇",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data.startswith("music:"))
+async def handle_music_callback(callback: CallbackQuery):
+    """Handle music download when user clicks a song button."""
+    short_key = callback.data.replace("music:", "")
+    
+    # Get song info from cache
+    song_info = music_cache.get(short_key)
+    if not song_info:
+        await callback.answer("⏰ Qidiruv eskirgan. Qaytadan qidiring.", show_alert=True)
+        return
+    
+    await callback.answer("⏳ Yuklanmoqda...")
+    
+    # Edit the message to show downloading status
+    await callback.message.edit_text(
+        f"⏳ Yuklanmoqda: **{song_info['title'][:50]}**...",
+        parse_mode="Markdown"
+    )
+    
+    # Download the music
+    loop = asyncio.get_event_loop()
+    filepath, title, artist = await loop.run_in_executor(
+        None, download_music, song_info['url']
+    )
+    
+    if filepath and os.path.exists(filepath):
+        try:
+            audio_file = FSInputFile(filepath)
+            await callback.message.answer_audio(
+                audio=audio_file,
+                title=title or song_info['title'],
+                performer=artist or song_info.get('artist', ''),
+                caption="🎵 Mana qo'shigingiz!"
+            )
+            await callback.message.delete()
+        except Exception as e:
+            logging.error(f"Error sending audio: {e}")
+            await callback.message.edit_text("😕 Audio yuborishda xatolik bo'ldi.")
+        finally:
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            except Exception as e:
+                logging.error(f"Error deleting file: {e}")
+    else:
+        await callback.message.edit_text(
+            "😕 Bu qo'shiqni yuklab bo'lmadi. Boshqasini tanlang."
+        )
+
 
 # ========================
 # Main
