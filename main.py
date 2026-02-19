@@ -196,16 +196,18 @@ def download_instagram_content(url: str) -> str:
 
 def extract_reels_audio(video_path: str) -> str:
     """
-    Extracts audio from a video file and saves it as MP3.
+    Extracts audio from a video file and saves it as MP3 using yt-dlp or ffmpeg.
     Returns the path to the MP3 file.
     """
     if not video_path or not os.path.exists(video_path):
+        logging.error(f"Cannot extract audio: file not found at {video_path}")
         return None
     
     # Generate MP3 path
     base_path = os.path.splitext(video_path)[0]
     mp3_path = f"{base_path}_audio.mp3"
     
+    # We'll try to use yt-dlp to extract audio from the local file
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -219,16 +221,20 @@ def extract_reels_audio(video_path: str) -> str:
     }
 
     try:
-        # We use yt-dlp to extract audio from the ALREADY DOWNLOADED file
+        logging.info(f"Extracting audio from {video_path}...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # yt-dlp can take a local file path as "URL"
+            # yt-dlp can process local files if prefixed with file://
+            # But on windows it's tricky, so we just pass the path
             ydl.extract_info(video_path, download=True)
             
             if os.path.exists(mp3_path):
+                logging.info(f"Successfully extracted audio: {mp3_path}")
                 return mp3_path
     except Exception as e:
         logging.error(f"Error extracting audio from video: {e}")
-        
+        if "ffmpeg" in str(e).lower():
+            logging.error("FFmpeg not found! Audio extraction failed.")
+            
     return None
 
 
@@ -321,9 +327,9 @@ def download_music(url: str) -> tuple:
     }
 
     try:
+        logging.info(f"Downloading music from {url}...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # yt-dlp changes ext to mp3 after postprocessing
             video_id = info.get('id', 'unknown')
             mp3_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
             title = info.get('title', 'Noma\'lum')
@@ -332,14 +338,21 @@ def download_music(url: str) -> tuple:
             if os.path.exists(mp3_path):
                 return mp3_path, title, artist
             
-            # Try to find the file with any extension and check
-            for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}.*")):
-                if f.endswith(('.mp3', '.m4a', '.opus', '.ogg', '.wav')):
-                    return f, title, artist
+            # If MP3 doesn't exist, check if another format exists (maybe ffmpeg failed)
+            files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}.*"))
+            if files:
+                # Prefer audio formats
+                for f in files:
+                    if f.endswith(('.mp3', '.m4a', '.opus', '.ogg', '.wav')):
+                        return f, title, artist
+                # Fallback to whatever was downloaded
+                return files[0], title, artist
             
             return None, None, None
     except Exception as e:
         logging.error(f"Music download error: {type(e).__name__}: {e}")
+        if "ffmpeg" in str(e).lower():
+            logging.error("FFmpeg not found! YouTube music download (as MP3) failed.")
         return None, None, None
 
 
