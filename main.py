@@ -11,6 +11,7 @@ from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButto
 from aiohttp import web, ClientSession
 import instaloader
 import yt_dlp
+import imageio_ffmpeg
 
 # Load environment variables
 load_dotenv()
@@ -212,6 +213,7 @@ def extract_reels_audio(video_path: str) -> str:
         'quiet': True,
         'no_warnings': True,
         'format': 'bestaudio/best',
+        'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -314,9 +316,10 @@ def download_music(url: str) -> tuple:
     
     ydl_opts = {
         'outtmpl': outtmpl,
-        'quiet': True,
-        'no_warnings': True,
+        'quiet': False, # Increased verbosity for logging
+        'no_warnings': False,
         'format': 'bestaudio/best',
+        'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -324,6 +327,9 @@ def download_music(url: str) -> tuple:
         }],
         'socket_timeout': 30,
         'retries': 3,
+        'nocheckcertificate': True,
+        'geo_bypass': True,
+        'noplaylist': True,
     }
 
     try:
@@ -336,11 +342,13 @@ def download_music(url: str) -> tuple:
             artist = info.get('uploader', '') or info.get('channel', '')
             
             if os.path.exists(mp3_path):
+                logging.info(f"Successfully downloaded and converted to MP3: {mp3_path}")
                 return mp3_path, title, artist
             
             # If MP3 doesn't exist, check if another format exists (maybe ffmpeg failed)
             files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}.*"))
             if files:
+                logging.warning(f"Extracted MP3 not found, but other files exist: {files}")
                 # Prefer audio formats
                 for f in files:
                     if f.endswith(('.mp3', '.m4a', '.opus', '.ogg', '.wav')):
@@ -348,11 +356,12 @@ def download_music(url: str) -> tuple:
                 # Fallback to whatever was downloaded
                 return files[0], title, artist
             
+            logging.error(f"No files found after yt-dlp execution for {url}")
             return None, None, None
     except Exception as e:
-        logging.error(f"Music download error: {type(e).__name__}: {e}")
+        logging.error(f"Music download error for {url}: {type(e).__name__}: {e}")
         if "ffmpeg" in str(e).lower():
-            logging.error("FFmpeg not found! YouTube music download (as MP3) failed.")
+            logging.error("FFmpeg error detected! Check if FFmpeg is installed and accessible.")
         return None, None, None
 
 
@@ -497,7 +506,7 @@ async def handle_music_callback(callback: CallbackQuery):
             await callback.message.delete()
         except Exception as e:
             logging.error(f"Error sending audio: {e}")
-            await callback.message.edit_text("😕 Audio yuborishda xatolik bo'ldi.")
+            await callback.message.edit_text("😕 Audio yuborishda xatolik bo'ldi. Fayl juda kattaligi yoki formatda muammo bo'lishi mumkin.")
         finally:
             try:
                 if os.path.exists(filepath):
@@ -506,7 +515,12 @@ async def handle_music_callback(callback: CallbackQuery):
                 logging.error(f"Error deleting file: {e}")
     else:
         await callback.message.edit_text(
-            "😕 Bu qo'shiqni yuklab bo'lmadi. Boshqasini tanlang."
+            "😕 Bu qo'shiqni yuklab bo'lmadi. \n\n"
+            "Sabablari: \n"
+            "1. Mualliflik huquqi bilan himoyalangan. \n"
+            "2. Juda katta hajmdagi fayl. \n"
+            "3. Tarmoqda vaqtinchalik uzilish. \n\n"
+            "Iltimos, boshqa qo'shiqni tanlab ko'ring."
         )
 
 
@@ -519,6 +533,13 @@ async def main():
         print("Error: BOT_TOKEN is missing in .env file.")
         return
     
+    # Check FFmpeg
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    if ffmpeg_exe:
+        logging.info(f"FFmpeg found: {ffmpeg_exe}")
+    else:
+        logging.error("FFmpeg NOT found! Audio features may not work.")
+
     # Start web server and keep-alive in background
     await start_web_server()
     asyncio.create_task(keep_alive())
